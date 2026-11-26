@@ -10,7 +10,8 @@ from scanner import scan
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("main")
 
-ERROR_REPEAT_SEC = 1800   # un mismo error se avisa por Telegram como mucho cada 30 min
+ERROR_REPEAT_SEC = 1800     # un mismo error se avisa por Telegram como mucho cada 30 min
+NODATA_REPEAT_SEC = 3600    # el aviso "ningún par devuelve velas" se repite como mucho cada hora
 
 
 def fmt(sig):
@@ -18,10 +19,11 @@ def fmt(sig):
     qm = " · QM" if sig["qm"] else ""
     return (
         f"{head} {sig['symbol']} ({config.TIMEFRAME}){qm}\n"
-        f"Score: {sig['score']}/100\n"
+        f"Score: {sig['score']:.0f}/100\n"
         f"Entrada: {sig['entry']:.6g}\n"
         f"SL: {sig['sl']:.6g}\n"
         f"TP: {sig['tp']:.6g}\n"
+        f"Coste estimado: {sig['cost_r']:.2f}R del riesgo\n"
         f"Volumen x{sig['vol_ratio']:.1f} · Compresión {sig['compression']:.2f}"
     )
 
@@ -61,6 +63,8 @@ def main():
     if config.TRADE_MODE != "live":
         head += "\n(en este modo las claves no se usan)"
     send(f"{head}\n{report}")
+    for note in config.CONFIG_NOTES:
+        send(f"⚠️ {note}")
 
     load_markets_with_retry(ex)
 
@@ -77,6 +81,7 @@ def main():
     day = None
     day_start_bal = None
     last_err = ("", 0.0)
+    last_nodata = 0.0
 
     while True:
         try:
@@ -86,7 +91,13 @@ def main():
                 day_start_bal = ex.balance_usdt()
                 day = today
 
-            for sig in scan(ex):
+            signals, stats = scan(ex)
+            if stats["pairs"] and stats["ok"] == 0 and now - last_nodata > NODATA_REPEAT_SEC:
+                send(f"⚠️ Ningún par devolvió velas de BingX. TF usado: {config.TIMEFRAME}, "
+                     f"intervalo enviado: {ex.sent_interval()}. Error: {stats['first_error'][:300]}")
+                last_nodata = now
+
+            for sig in signals:
                 sym = sig["symbol"]
                 if now - cooldown.get(sym, 0) < config.COOLDOWN_MIN * 60:
                     continue
@@ -96,8 +107,8 @@ def main():
                 if config.TRADE_MODE == "dry":
                     send(f"🧪 DRY: se habría abierto {sym} {sig['side']}")
                 elif trade_ok and can_trade(ex, sig, day_start_bal):
-                    ex.place_trade(sig)
-                    send(f"✅ Orden ejecutada: {sym} {sig['side']}")
+                    if ex.place_trade(sig) is not None:
+                        send(f"✅ Orden ejecutada: {sym} {sig['side']}")
         except Exception as e:
             log.exception("Error en ciclo: %s", e)
             kind = type(e).__name__
